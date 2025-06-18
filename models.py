@@ -387,7 +387,159 @@ class DiT(nn.Module):
         eps = torch.cat([half_eps, half_eps], dim=0)
         return torch.cat([eps, rest], dim=1)
 
+class DiT_Flow_Matching(nn.Module):
+    """
+    Diffusion model with a Transformer backbone.
+    """
+    def __init__(
+        self,
+        input_size=256,
+        hidden_size=1152,
+        depth=28,
+        num_heads=16,
+        mlp_ratio=4.0,
+        class_dropout_prob=0.1,
+        learn_sigma=True,
+        seq_len=10,
+    ):
+        super().__init__()
+        self.learn_sigma = learn_sigma
+        self.in_dims = input_size
+        self.out_dims = input_size
+        self.num_heads = num_heads
 
+        self.x_embedder = SequenceEmbedder(input_size, hidden_size, seq_len=seq_len)
+        self.t_embedder = TimestepEmbedder(hidden_size)
+        self.y_embedder = ConditionEmbedder(hidden_size, hidden_size, class_dropout_prob)
+        
+        # Add Contrastive_Curve and GraphHop models
+        self.contrastive_curve = ContrastiveEncoder(in_channels=1, emb_size=hidden_size//2)
+        self.contrastive_adj = ContrastiveEncoder(in_channels=1, emb_size=hidden_size//2)
+
+        # Will use fixed sin-cos embedding:
+        self.pos_embed = nn.Parameter(torch.zeros(1, seq_len, hidden_size), requires_grad=False)
+
+        self.blocks = nn.ModuleList([
+            DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)
+        ])
+        self.final_layer = FinalLayer(hidden_size, self.out_dims)
+
+        self.initialize_weights()
+
+    def initialize_weights(self):
+        # Initialize transformer layers:
+        def _basic_init(module):
+            if isinstance(module, nn.Linear):
+                torch.nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+        self.apply(_basic_init)
+
+        # Initialize (and freeze) pos_embed by sin-cos embedding:
+        pos_embed = get_1d_sincos_pos_embed(self.pos_embed.shape[-1], self.x_embedder.seq_len)
+        self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
+
+        # Initialize sequence embedder
+        if hasattr(self.x_embedder, 'proj'):
+            if isinstance(self.x_embedder.proj, nn.Linear):
+                nn.init.xavier_uniform_(self.x_embedder.proj.weight)
+                if self.x_embedder.proj.bias is not None:
+                    nn.init.constant_(self.x_embedder.proj.bias, 0)
+            elif isinstance(self.x_embedder.proj, nn.Conv1d):
+                nn.init.xavier_uniform_(self.x_embedder.proj.weight.view(self.x_embedder.proj.weight.shape[0], -1))
+                if self.x_embedder.proj.bias is not None:
+                    nn.init.constant_(self.x_embedder.proj.bias, 0)
+
+        # Initialize label embedding table:
+        if hasattr(self.y_embedder, 'embedding_table'):
+            nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
+        elif hasattr(self.y_embedder, 'proj'):
+            # Initialize each layer in the Sequential proj
+            for layer in self.y_embedder.proj:
+                if isinstance(layer, nn.Linear):
+                    nn.init.xavier_uniform_(layer.weight)
+                    if layer.bias is not None:
+                        nn.init.constant_(layer.bias, 0)
+
+        # Initialize timestep embedding MLP:
+        if hasattr(self.t_embedder, 'mlp'):
+            nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
+            nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
+            if hasattr(self.t_embedder.mlp[0], 'bias') and self.t_embedder.mlp[0].bias is not None:
+                nn.init.constant_(self.t_embedder.mlp[0].bias, 0)
+            if hasattr(self.t_embedder.mlp[2], 'bias') and self.t_embedder.mlp[2].bias is not None:
+                nn.init.constant_(self.t_embedder.mlp[2].bias, 0)
+
+        # Zero-out adaLN modulation layers in DiT blocks:
+        for block in self.blocks:
+            if hasattr(block, 'adaLN_modulation'):
+                nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
+                nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+
+        # Zero-out output layers:
+        for final_layer in [self.final_layer]:
+            if hasattr(final_layer, 'adaLN_modulation'):
+                nn.init.constant_(final_layer.adaLN_modulation[-1].weight, 0)
+                nn.init.constant_(final_layer.adaLN_modulation[-1].bias, 0)
+            if hasattr(final_layer, 'linear'):
+                nn.init.constant_(final_layer.linear.weight, 0)
+                nn.init.constant_(final_layer.linear.bias, 0)
+
+    def forward(self, x, t, **model_kwargs):
+        # Extract conditioning data from model_kwargs
+        curves = model_kwargs.get('curves')
+        adj = model_kwargs.get('adj')
+
+        # 1. Input embedding
+        x_embed = self.x_embedder(x)  # (batch, seq_len, hidden_dim)
+        x = x_embed + self.pos_embed  # Add positional embedding
+
+        # 2. Time embedding
+        t_embed = self.t_embedder(t)  # (batch, hidden_dim)
+
+        # 3. Process conditioning data
+        # Preprocess and embed curves
+        curves = preprocess_curves(curves).unsqueeze(1)
+        curve_embed = self.contrastive_curve(curves)  # (batch, d_model//2)
+        
+        # Process graph adjacency
+        adj_embed = self.contrastive_adj(adj)  # (batch, d_model//2)
+        
+        # Combine conditioning embeddings
+        y = torch.cat([curve_embed, adj_embed], dim=1)  # (batch, d_model)
+
+        y_embed = self.y_embedder(y, self.training)  # (batch, hidden_dim)
+
+        # 4. Combine all conditioning
+        c = t_embed + y_embed  # (batch, hidden_dim)
+
+        # 5. Transformer blocks
+        for block in self.blocks:
+            x = block(x, c)
+
+        # 6. Final projection (mean and variance)
+        x_out = self.final_layer(x, c)  # (batch, seq_len, dim)
+        
+        return x_out
+
+    def forward_with_cfg(self, x, t, y, cfg_scale):
+        """
+        Forward pass of DiT, but also batches the unconditional forward pass for classifier-free guidance.
+        """
+        # https://github.com/openai/glide-text2im/blob/main/notebooks/text2im.ipynb
+        half = x[: len(x) // 2]
+        combined = torch.cat([half, half], dim=0)
+        model_out = self.forward(combined, t, y)
+        # For exact reproducibility reasons, we apply classifier-free guidance on only
+        # three channels by default. The standard approach to cfg applies it to all channels.
+        # This can be done by uncommenting the following line and commenting-out the line following that.
+        # eps, rest = model_out[:, :self.in_channels], model_out[:, self.in_channels:]
+        eps, rest = model_out[:, :3], model_out[:, 3:]
+        cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
+        half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
+        eps = torch.cat([half_eps, half_eps], dim=0)
+        return torch.cat([eps, rest], dim=1)
+    
 #################################################################################
 #                   Sine/Cosine Positional Embedding Functions                  #
 #################################################################################

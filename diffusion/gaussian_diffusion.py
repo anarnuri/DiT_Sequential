@@ -713,51 +713,51 @@ class GaussianDiffusion:
         output = th.where((t == 0), decoder_nll, kl)
         return {"output": output, "pred_xstart": out["pred_xstart"]}
 
-    # def training_losses(self, model, x_start, t, model_kwargs=None, noise=None):
-    #     """
-    #     Compute training losses for Flow Matching while maintaining MSE-style loss structure.
-    #     :param model: the model to evaluate loss on.
-    #     :param x_start: the [N x C x ...] tensor of inputs.
-    #     :param t: a batch of timestep indices (now used for flow time).
-    #     :param model_kwargs: if not None, a dict of extra keyword arguments.
-    #     :param noise: if specified, used as the target sample (for reproducibility).
-    #     :return: a dict with the key "loss" containing a tensor of shape [N].
-    #     """
-    #     if model_kwargs is None:
-    #         model_kwargs = {}
+    def training_losses_flow_matching(self, model, x_start, t, model_kwargs=None, noise=None):
+        """
+        Compute training losses for Flow Matching while maintaining MSE-style loss structure.
+        :param model: the model to evaluate loss on.
+        :param x_start: the [N x C x ...] tensor of inputs.
+        :param t: a batch of timestep indices (now used for flow time).
+        :param model_kwargs: if not None, a dict of extra keyword arguments.
+        :param noise: if specified, used as the target sample (for reproducibility).
+        :return: a dict with the key "loss" containing a tensor of shape [N].
+        """
+        if model_kwargs is None:
+            model_kwargs = {}
         
-    #     # 1. Sample noise from prior (standard normal) if not provided
-    #     if noise is None:
-    #         noise = torch.randn_like(x_start)
+        # 1. Sample noise from prior (standard normal) if not provided
+        if noise is None:
+            noise = torch.randn_like(x_start)
         
-    #     # 2. Convert discrete timesteps t to continuous time in [0,1]
-    #     continuous_t = t.float() / (self.num_timesteps - 1)  # Normalize to [0,1]
+        # 2. Convert discrete timesteps t to continuous time in [0,1]
+        continuous_t = t.float() / (self.num_timesteps - 1)  # Normalize to [0,1]
         
-    #     # 3. Compute flow path (linear interpolation)
-    #     x_t = continuous_t.view(-1, *([1]*(x_start.dim()-1))) * x_start + \
-    #         (1 - continuous_t.view(-1, *([1]*(x_start.dim()-1)))) * noise
+        # 3. Compute flow path (linear interpolation)
+        x_t = continuous_t.view(-1, *([1]*(x_start.dim()-1))) * x_start + \
+            (1 - continuous_t.view(-1, *([1]*(x_start.dim()-1)))) * noise
         
-    #     # 4. Compute target vector field (optimal transport direction)
-    #     target = noise - x_start  # This replaces the 'epsilon' target in diffusion
+        # 4. Compute target vector field (optimal transport direction)
+        target = noise - x_start  # This replaces the 'epsilon' target in diffusion
         
-    #     # 5. Get model predictions (same signature as original)
-    #     model_output = model(x_t, t, **model_kwargs)
+        # 5. Get model predictions (same signature as original)
+        model_output = model(x_t, t, **model_kwargs)
         
-    #     # 6. Compute MSE loss (same structure as original)
-    #     terms = {}
-    #     if self.model_mean_type == ModelMeanType.EPSILON:
-    #         # Directly compare to vector field (recommended for Flow Matching)
-    #         squared_diff = (target - model_output) ** 2
-    #     elif self.model_mean_type == ModelMeanType.START_X:
-    #         # Alternative: Predict x_start directly
-    #         squared_diff = (x_start - model_output) ** 2
-    #     else:
-    #         raise NotImplementedError(f"ModelMeanType {self.model_mean_type} not supported for Flow Matching")
+        # 6. Compute MSE loss (same structure as original)
+        terms = {}
+        if self.model_mean_type == ModelMeanType.EPSILON:
+            # Directly compare to vector field (recommended for Flow Matching)
+            squared_diff = (target - model_output) ** 2
+        elif self.model_mean_type == ModelMeanType.START_X:
+            # Alternative: Predict x_start directly
+            squared_diff = (x_start - model_output) ** 2
+        else:
+            raise NotImplementedError(f"ModelMeanType {self.model_mean_type} not supported for Flow Matching")
         
-    #     terms["mse"] = mean_flat(squared_diff)
-    #     terms["loss"] = terms["mse"]  # Maintain original return structure
+        terms["mse"] = mean_flat(squared_diff)
+        terms["loss"] = terms["mse"]  # Maintain original return structure
 
-    #     return terms
+        return terms
 
     def training_losses(self, model, x_start, t, model_kwargs=None, noise=None):
         """
@@ -771,114 +771,57 @@ class GaussianDiffusion:
         :return: a dict with the key "loss" containing a tensor of shape [N].
                 Some mean or variance settings may also have other keys.
         """
-        # # print("\n=== ENTERING training_losses ===")
-        # # print(f"Initial x_start shape: {x_start.shape}")
-        # # print(f"Initial t shape: {t.shape}")
-        # # print(f"Initial model_kwargs: {model_kwargs}")
-        
+
         if model_kwargs is None:
             model_kwargs = {}
-            # # print("model_kwargs was None, set to empty dict")
         
         if noise is None:
-            # # print("Generating new noise tensor")
             noise = th.randn_like(x_start)
-        # # print(f"Noise tensor shape: {noise.shape}")
-        
-        # # print("\n--- Computing q_sample ---")
+
         x_t = self.q_sample(x_start, t, noise=noise)
-        # # print(f"x_t shape after q_sample: {x_t.shape}")
         
         terms = {}
-        # # print(f"\n--- Processing loss type: {self.loss_type} ---")
+
+        model_output = model(x_t, t, **model_kwargs)
         
-        if self.loss_type == LossType.KL or self.loss_type == LossType.RESCALED_KL:
-            # # print("Processing KL or RESCALED_KL loss")
+        if self.model_var_type in [
+            ModelVarType.LEARNED,
+            ModelVarType.LEARNED_RANGE,
+        ]:
+            B, C = x_t.shape[:2]
+
+            assert model_output.shape == (B, C * 2, *x_t.shape[2:])
+            
+            model_output, model_var_values = th.split(model_output, C, dim=1)
+            
+            frozen_out = th.cat([model_output.detach(), model_var_values], dim=1)
+
             vb_terms = self._vb_terms_bpd(
-                model=model,
+                model=lambda *args, r=frozen_out: r,
                 x_start=x_start,
                 x_t=x_t,
                 t=t,
                 clip_denoised=False,
-                model_kwargs=model_kwargs,
             )
-            # # print(f"vb_terms['output'] shape: {vb_terms['output'].shape}")
-            terms["loss"] = vb_terms["output"]
-            
-            if self.loss_type == LossType.RESCALED_KL:
-                # # print(f"Scaling KL loss by num_timesteps ({self.num_timesteps})")
-                terms["loss"] *= self.num_timesteps
-                
-        elif self.loss_type == LossType.MSE or self.loss_type == LossType.RESCALED_MSE:
-            # print("\n--- Computing model output ---")
-            model_output = model(x_t, t, **model_kwargs)
-            # print(f"Raw model_output shape: {model_output.shape}")
-            
-            if self.model_var_type in [
-                ModelVarType.LEARNED,
-                ModelVarType.LEARNED_RANGE,
-            ]:
-                # print("\n--- Processing learned variance ---")
-                B, C = x_t.shape[:2]
-                # print(f"Batch size (B): {B}, Channels (C): {C}")
-                # print(f"Expected model_output shape: {(B, C * 2, *x_t.shape[2:])}")
-                assert model_output.shape == (B, C * 2, *x_t.shape[2:])
-                
-                model_output, model_var_values = th.split(model_output, C, dim=1)
-                # print(f"Split model_output shape: {model_output.shape}")
-                # print(f"model_var_values shape: {model_var_values.shape}")
-                
-                frozen_out = th.cat([model_output.detach(), model_var_values], dim=1)
-                # print(f"frozen_out shape: {frozen_out.shape}")
-                
-                # print("\n--- Computing variational bound terms ---")
-                vb_terms = self._vb_terms_bpd(
-                    model=lambda *args, r=frozen_out: r,
-                    x_start=x_start,
-                    x_t=x_t,
-                    t=t,
-                    clip_denoised=False,
-                )
-                terms["vb"] = vb_terms["output"]
-                # print(f"vb term shape: {terms['vb'].shape}")
-                
-                if self.loss_type == LossType.RESCALED_MSE:
-                    scale = self.num_timesteps / 1000.0
-                    # print(f"Scaling vb term by {scale}")
-                    terms["vb"] *= scale
-            
-            # print("\n--- Computing target ---")
-            target = {
-                ModelMeanType.PREVIOUS_X: self.q_posterior_mean_variance(
-                    x_start=x_start, x_t=x_t, t=t
-                )[0],
-                ModelMeanType.START_X: x_start,
-                ModelMeanType.EPSILON: noise,
-            }[self.model_mean_type]
-            # print(f"Selected target type: {self.model_mean_type}")
-            # print(f"Target shape: {target.shape}")
-            # print(f"model_output shape: {model_output.shape}")
-            # print(f"x_start shape: {x_start.shape}")
-            
-            assert model_output.shape == target.shape == x_start.shape
-            squared_diff = (target - model_output) ** 2
-            # print(f"squared_diff shape before mean_flat: {squared_diff.shape}")
-            
-            terms["mse"] = mean_flat(squared_diff)
-            # print(f"mse term shape: {terms['mse'].shape}")
-            
-            if "vb" in terms:
-                # print("Combining mse and vb terms")
-                terms["loss"] = terms["mse"] + terms["vb"]
-            else:
-                print("Using only mse term")
-                terms["loss"] = terms["mse"]
-            # print(f"Final loss shape: {terms['loss'].shape}")
-        else:
-            raise NotImplementedError(self.loss_type)
+            terms["vb"] = vb_terms["output"]
         
-        # print("\n=== RETURNING from training_losses ===")
-        # print("Final terms keys:", terms.keys())
+        target = {
+            ModelMeanType.PREVIOUS_X: self.q_posterior_mean_variance(
+                x_start=x_start, x_t=x_t, t=t
+            )[0],
+            ModelMeanType.START_X: x_start,
+            ModelMeanType.EPSILON: noise,
+        }[self.model_mean_type]
+        
+        assert model_output.shape == target.shape == x_start.shape
+        squared_diff = (target - model_output) ** 2
+        
+        terms["mse"] = mean_flat(squared_diff)
+        
+        if "vb" in terms:
+            terms["loss"] = terms["mse"] + terms["vb"]
+        else:
+            terms["loss"] = terms["mse"]
         
         return terms
 
