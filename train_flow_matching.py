@@ -198,7 +198,7 @@ def main(args):
             model_kwargs = dict(curves=curves, adj=adj)
             
             # Get loss components
-            loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
+            loss_dict = diffusion.training_losses_flow_matching(model, x, t, model_kwargs)
             loss = loss_dict["loss"].mean()
             
             # Backpropagation
