@@ -257,7 +257,7 @@ def main(args):
                 t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
                 model_kwargs = dict(curves=curves, adj=adj)
                 
-                loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
+                loss_dict = diffusion.training_losses_flow_matching(model, x, t, model_kwargs)
                 loss = loss_dict["loss"].mean()
                 
                 optimizer.zero_grad()
@@ -305,7 +305,7 @@ def main(args):
                     t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
                     model_kwargs = dict(curves=curves, adj=adj)
                     
-                    loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
+                    loss_dict = diffusion.training_losses_flow_matching(model, x, t, model_kwargs)
                     loss = loss_dict["loss"].mean()
 
                     val_loss += loss.item()
